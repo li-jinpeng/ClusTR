@@ -9,14 +9,40 @@ from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
 from data_provider.uea import subsample, interpolate_missing, Normalizer
+from skfuzzy.cluster import cmeans, cmeans_predict
 from sktime.datasets import load_from_tsfile_to_dataframe
 from tslearn.clustering import TimeSeriesKMeans
 from k_means_constrained import KMeansConstrained
+from tqdm import tqdm
 import warnings
+import random
 from utils.augmentation import run_augmentation_single
+import utils.augmentation as aug
 
 
 warnings.filterwarnings('ignore')
+
+
+aug_method = [aug.jitter, aug.time_warp, aug.scaling, aug.window_slice, aug.window_warp, aug.magnitude_warp]
+
+def get_aug_data(args, x, x_mark, y, y_mark, centers, num):
+    for cluster_index in range(args.cluster_amount):
+        with tqdm(total=(num-len(x[cluster_index])), desc=f'cluster:{cluster_index} augmentation:') as pbar:
+            while len(x[cluster_index]) < num:
+                select_x_index = random.randint(0, len(x[cluster_index])-1)
+                seq_x = x[cluster_index][select_x_index]
+                seq_x = seq_x[np.newaxis, :, :]
+                aug_x = aug_method[random.randint(0,len(aug_method)-1)](seq_x)
+                aug_x = aug_x.reshape(aug_x.shape[1], aug_x.shape[2])
+                distances = np.linalg.norm(centers - aug_x.reshape(-1), axis=1)
+                if np.argmin(distances) == cluster_index:
+                    x[cluster_index].append(aug_x)
+                    x_mark[cluster_index].append(x_mark[cluster_index][select_x_index])
+                    y[cluster_index].append(y[cluster_index][select_x_index])
+                    y_mark[cluster_index].append(y_mark[cluster_index][select_x_index])
+                    centers[cluster_index] = (centers[cluster_index] * (len(x[cluster_index])-1) + aug_x.reshape(-1)) / len(x[cluster_index])
+                    pbar.update(1)
+    return x, x_mark, y, y_mark, centers
 
 
 def fft_seq(seq_x):
@@ -34,11 +60,14 @@ def get_clustr_data(args, data, stamp, centers):
     x_mark = [[] for _ in range(args.cluster_amount)]
     y = [[] for _ in range(args.cluster_amount)]
     y_mark = [[] for _ in range(args.cluster_amount)]
+    ds = [[] for _ in range(args.cluster_amount)]
     
     num_samples = data.shape[0] - args.seq_len - args.pred_len + 1
     num_features = data.shape[1]
     
+    aug_flag = False
     if centers is None:
+        aug_flag = True
         data_x = []
         for sample in range(num_samples):
             for feature in range(num_features):
@@ -49,50 +78,58 @@ def get_clustr_data(args, data, stamp, centers):
                     data_x.append(fft_seq(seq_x))
                 else:
                     raise NotImplementedError
-        # km = TimeSeriesKMeans(n_clusters=args.cluster_amount, verbose=True, n_jobs=64, random_state=args.seed, tol=1e-6)
+        km = TimeSeriesKMeans(n_clusters=args.cluster_amount, verbose=True, n_jobs=128, random_state=args.seed, tol=1e-6).fit(data_x)
+        # km = KMeansConstrained(n_clusters=args.cluster_amount,size_min=len(data_x)//args.cluster_amount-1000,size_max=len(data_x)//args.cluster_amount+1000,n_jobs=128,verbose=True)
         # pred_y = km.fit_predict(data_x)
-        km = KMeansConstrained(n_clusters=args.cluster_amount,size_min=len(data_x)//args.cluster_amount-1000,size_max=len(data_x)//args.cluster_amount+1000,n_jobs=128,verbose=True)
-        pred_y = km.fit_predict(data_x)
         centers = km.cluster_centers_.reshape(args.cluster_amount, -1)
-        pred_y_index = 0
-        for sample in range(num_samples):
-            for feature in range(num_features):
-                seq_x = data[sample:sample+args.seq_len, feature:feature+1]
-                seq_y = data[sample+args.seq_len:sample+args.seq_len+args.pred_len, feature:feature+1]
-                seq_x_mark = stamp[sample:sample+args.seq_len]
-                seq_y_mark = stamp[sample+args.seq_len:sample+args.seq_len+args.pred_len]
-                closest_cluster_index = pred_y[pred_y_index]
-                x[closest_cluster_index].append(seq_x)
-                y[closest_cluster_index].append(seq_y)
-                x_mark[closest_cluster_index].append(seq_x_mark)
-                y_mark[closest_cluster_index].append(seq_y_mark)
-                pred_y_index += 1
-    else:
-        ds = [[],[],[]]
-        for sample in range(num_samples):
-            for feature in range(num_features):
-                seq_x = data[sample:sample+args.seq_len, feature:feature+1]
-                seq_y = data[sample+args.seq_len:sample+args.seq_len+args.pred_len, feature:feature+1]
-                seq_x_mark = stamp[sample:sample+args.seq_len]
-                seq_y_mark = stamp[sample+args.seq_len:sample+args.seq_len+args.pred_len]
-                if args.cluster_domain == 'time':
-                    cluster_x = seq_x.reshape(-1)
-                elif args.cluster_domain == 'frequency':
-                    cluster_x = fft_seq(seq_x.reshape(-1))
-                else:
-                    raise NotImplementedError
-                centers = centers[:, :args.seq_len]
-                distances = np.linalg.norm(centers - cluster_x, axis=1)
-                closest_cluster_index = np.argmin(distances)
-                ds[closest_cluster_index].append(distances[closest_cluster_index])
-                x[closest_cluster_index].append(seq_x)
-                y[closest_cluster_index].append(seq_y)
-                x_mark[closest_cluster_index].append(seq_x_mark)
-                y_mark[closest_cluster_index].append(seq_y_mark)
-        print('=============================')
-        print([np.mean(np.array(i)) for i in ds])
-        print('=============================')
-    return [np.array(i) for i in x], [np.array(i) for i in x_mark], [np.array(i) for i in y], [np.array(i) for i in y_mark], centers
+
+    for sample in range(num_samples):
+        for feature in range(num_features):
+            seq_x = data[sample:sample+args.seq_len, feature:feature+1]
+            seq_y = data[sample+args.seq_len:sample+args.seq_len+args.pred_len, feature:feature+1]
+            seq_x_mark = stamp[sample:sample+args.seq_len]
+            seq_y_mark = stamp[sample+args.seq_len:sample+args.seq_len+args.pred_len]
+            if args.cluster_domain == 'time':
+                cluster_x = seq_x.reshape(-1)
+            elif args.cluster_domain == 'frequency':
+                cluster_x = fft_seq(seq_x.reshape(-1))
+            else:
+                raise NotImplementedError
+            centers = centers[:, :args.seq_len]
+            distances = np.linalg.norm(centers - cluster_x, axis=1)
+            closest_cluster_index = np.argmin(distances)
+            x[closest_cluster_index].append(seq_x)
+            y[closest_cluster_index].append(seq_y)
+            x_mark[closest_cluster_index].append(seq_x_mark)
+            y_mark[closest_cluster_index].append(seq_y_mark)
+            ds[closest_cluster_index].append(distances[closest_cluster_index])
+    
+    if aug_flag:
+        x, x_mark, y, y_mark, centers = get_aug_data(args, x, x_mark, y, y_mark, centers, num_features * num_samples)
+        data = [[] for _ in range(args.cluster_amount)]
+        for cluster_index in range(args.cluster_amount):
+            for i in range(len(x[cluster_index])):
+                data[cluster_index].append((
+                    x[cluster_index][i],
+                    y[cluster_index][i],
+                    x_mark[cluster_index][i],
+                    y_mark[cluster_index][i],
+                ))
+            random.shuffle(data[cluster_index])
+        
+        x = [[] for _ in range(args.cluster_amount)]
+        x_mark = [[] for _ in range(args.cluster_amount)]
+        y = [[] for _ in range(args.cluster_amount)]
+        y_mark = [[] for _ in range(args.cluster_amount)]
+        ds = [[] for _ in range(args.cluster_amount)]
+        for cluster_index in range(args.cluster_amount):
+            for i in range(len(data[cluster_index])):
+                x[cluster_index].append(data[cluster_index][i][0])
+                y[cluster_index].append(data[cluster_index][i][1])
+                x_mark[cluster_index].append(data[cluster_index][i][2])
+                y_mark[cluster_index].append(data[cluster_index][i][3])
+                ds[cluster_index].append(np.sqrt(np.sum((data[cluster_index][i][0].reshape(-1) - centers[cluster_index]) ** 2)))
+    return [np.array(i) for i in x], [np.array(i) for i in x_mark], [np.array(i) for i in y], [np.array(i) for i in y_mark], centers, [np.array(i) for i in ds]
 
 
 class Dataset_ClusTR(Dataset):
@@ -103,6 +140,7 @@ class Dataset_ClusTR(Dataset):
         self.args = args
         self.size = size
         self.features = features
+        self.flag = flag
         self.target = target
         self.data_path = data_path
         self.root_path = root_path
@@ -111,44 +149,6 @@ class Dataset_ClusTR(Dataset):
         self.freq = freq
         self.seasonal_patterns = seasonal_patterns
         self.data_name = data_path.split('.')[0]
-        
-        # ./ETT-small/ETTh1_time_3_96_train/
-        self.clustr_data_path = os.path.join(
-            root_path, 
-            f'{self.data_name}_{self.args.cluster_domain}_{self.args.cluster_amount}_{self.args.pred_len}'
-        )
-        if not os.path.exists(self.clustr_data_path):
-            os.mkdir(self.clustr_data_path)
-            self.generate_clustr_data()
-        
-        self.data_x_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_x.npy'
-        self.data_x_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_x_mark.npy'
-        self.data_y_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_y.npy'
-        self.data_y_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_y_mark.npy'
-        if not (os.path.exists(self.data_x_path) and os.path.exists(self.data_y_path) \
-            and os.path.exists(self.data_x_mark_path) and os.path.exists(self.data_y_mark_path)):
-            raise FileNotFoundError
-        
-        data_x = np.load(self.data_x_path)
-        data_y = np.load(self.data_y_path)
-        self.data_x_mark = np.load(self.data_x_mark_path)
-        self.data_y_mark = np.load(self.data_y_mark_path)
-        if len(data_x) != 0:
-            self.scaler = StandardScaler()
-            fit_data_path = f'{self.clustr_data_path}/{self.args.cluster_index}_train_x.npy'
-            fit_data = np.load(fit_data_path)
-            self.scaler.fit(fit_data.reshape(fit_data.shape[0] * fit_data.shape[1], -1))
-            self.data_x = data_x.reshape(data_x.shape[0] * data_x.shape[1], -1)
-            self.data_y = data_y.reshape(data_y.shape[0] * data_y.shape[1], -1)
-            self.data_x = self.scaler.transform(self.data_x)
-            self.data_y = self.scaler.transform(self.data_y)
-            self.data_x = self.data_x.reshape(data_x.shape[0], data_x.shape[1], 1)
-            self.data_y = self.data_y.reshape(data_y.shape[0], data_y.shape[1], 1)
-        else:
-            self.data_x = data_x
-            self.data_y = data_y
-            
-    def generate_clustr_data(self):
         
         if self.size == None:
             self.seq_len = 24 * 4 * 4
@@ -160,6 +160,7 @@ class Dataset_ClusTR(Dataset):
             self.pred_len = self.size[2]
             
         df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        
         if 'ETTh' in self.data_name:
             self.border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
             self.border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
@@ -170,18 +171,55 @@ class Dataset_ClusTR(Dataset):
             num_train = int(len(df_raw) * 0.7)
             num_test = int(len(df_raw) * 0.2)
             num_vali = len(df_raw) - num_train - num_test
-            self.border1s = [0, len(df_raw) - num_test - self.seq_len]
-            self.border2s = [num_train + num_vali, len(df_raw)]
+            self.border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
+            self.border2s = [num_train, num_train + num_vali, len(df_raw)]
 
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
             df_data = df_raw[cols_data]
         elif self.features == 'S':
             df_data = df_raw[[self.target]]
-    
-        self.data = df_data.values
+        
+        self.scaler = StandardScaler()
+        if self.scale:
+            train_data = df_data[self.border1s[0]:self.border2s[0]]
+            self.scaler.fit(train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
+        
+        self.data = data
         self.df_raw  = df_raw
         
+        # ./ETT-small/ETTh1_time_3_96_train/
+        clustr_data_path = os.path.join(
+            root_path, 
+            f'{self.data_name}_{self.args.cluster_domain}_{self.args.cluster_amount}'
+        )
+        self.clustr_data_path = os.path.join(clustr_data_path, f'pred_len_{self.args.pred_len}')
+        if not os.path.exists(clustr_data_path):
+            os.mkdir(clustr_data_path)
+            os.mkdir(self.clustr_data_path)
+            self.generate_clustr_data()
+        if os.path.exists(clustr_data_path) and not os.path.exists(self.clustr_data_path):
+            os.mkdir(self.clustr_data_path)
+            self.generate_clustr_data()
+        
+        self.data_x_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_x.npy'
+        self.data_x_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_x_mark.npy'
+        self.data_y_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_y.npy'
+        self.data_y_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_{flag}_y_mark.npy'
+        if not (os.path.exists(self.data_x_path) and os.path.exists(self.data_y_path) \
+            and os.path.exists(self.data_x_mark_path) and os.path.exists(self.data_y_mark_path)):
+            self.generate_clustr_data()
+        
+        self.data_x = np.load(self.data_x_path)
+        self.data_y = np.load(self.data_y_path)
+        self.data_x_mark = np.load(self.data_x_mark_path)
+        self.data_y_mark = np.load(self.data_y_mark_path)
+        self.ds = np.load(f'{self.clustr_data_path}/{self.args.cluster_index}_{self.flag}_ds.npy')
+                    
+    def generate_clustr_data(self):
         centers = None
         for set_type in range(2):
             if set_type == 0:
@@ -204,7 +242,7 @@ class Dataset_ClusTR(Dataset):
                 data_stamp = data_stamp.transpose(1, 0)
             
             sub_data = self.data[border1:border2]
-            clustr_data_x, clustr_data_x_mark, clustr_data_y, clustr_data_y_mark, centers = \
+            clustr_data_x, clustr_data_x_mark, clustr_data_y, clustr_data_y_mark, centers, ds = \
                 get_clustr_data(self.args, sub_data, data_stamp, centers)
 
             for clustr_index in range(self.args.cluster_amount):
@@ -219,19 +257,22 @@ class Dataset_ClusTR(Dataset):
                     np.save(f'{self.clustr_data_path}/{clustr_index}_train_y.npy',clustr_data_y[clustr_index][:split])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_train_x_mark.npy',clustr_data_x_mark[clustr_index][:split])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_train_y_mark.npy',clustr_data_y_mark[clustr_index][:split])
+                    np.save(f'{self.clustr_data_path}/{clustr_index}_train_ds.npy', ds[clustr_index][:split])
                     
                     np.save(f'{self.clustr_data_path}/{clustr_index}_val_x.npy',clustr_data_x[clustr_index][split:])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_val_y.npy',clustr_data_y[clustr_index][split:])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_val_x_mark.npy',clustr_data_x_mark[clustr_index][split:])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_val_y_mark.npy',clustr_data_y_mark[clustr_index][split:])
+                    np.save(f'{self.clustr_data_path}/{clustr_index}_val_ds.npy', ds[clustr_index][split:])
                 else:
+                    np.save(f'{self.clustr_data_path}/{clustr_index}_test_ds.npy', ds[clustr_index])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_test_x.npy', clustr_data_x[clustr_index])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_test_y.npy', clustr_data_y[clustr_index])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_test_x_mark.npy', clustr_data_x_mark[clustr_index])
                     np.save(f'{self.clustr_data_path}/{clustr_index}_test_y_mark.npy', clustr_data_y_mark[clustr_index])
     
     def __getitem__(self, index):
-        return self.data_x[index], self.data_y[index], self.data_x_mark[index], self.data_y_mark[index]
+        return self.data_x[index], self.data_y[index], self.data_x_mark[index], self.data_y_mark[index], self.ds[index]
     
     def __len__(self):
         return len(self.data_x)
@@ -239,7 +280,123 @@ class Dataset_ClusTR(Dataset):
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
   
-                
+
+class Dataset_ETT_hour_test(Dataset):
+    def __init__(self, args, root_path, flag='train', size=None,
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+        # size [seq_len, label_len, pred_len]
+        self.args = args
+        # info
+        if size == None:
+            self.seq_len = 24 * 4 * 4
+            self.label_len = 24 * 4
+            self.pred_len = 24 * 4
+        else:
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
+        # init
+        assert flag in ['train', 'test', 'val']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+
+        self.root_path = root_path
+        self.data_path = data_path
+        self.__read_data__()
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+
+        border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
+        border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
+        border1 = border1s[self.set_type]
+        border2 = border2s[self.set_type]
+
+        if self.features == 'M' or self.features == 'MS':
+            cols_data = df_raw.columns[1:]
+            df_data = df_raw[cols_data]
+        elif self.features == 'S':
+            df_data = df_raw[[self.target]]
+
+        if self.scale:
+            train_data = df_data[border1s[0]:border2s[0]]
+            self.scaler.fit(train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
+
+        df_stamp = df_raw[['date']][border1:border2]
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        if self.timeenc == 0:
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
+            data_stamp = df_stamp.drop(['date'], 1).values
+        elif self.timeenc == 1:
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = data_stamp.transpose(1, 0) 
+
+        self.data = data[border1:border2]
+
+        self.data_stamp = data_stamp
+        
+        self.data_name = self.data_path.split('.')[0]
+        clustr_data_path = os.path.join(
+            self.root_path, 
+            f'{self.data_name}_{self.args.cluster_domain}_{self.args.cluster_amount}'
+        )
+        self.num_samples = self.data.shape[0] - self.seq_len - self.pred_len + 1
+        self.num_features = self.data.shape[1]
+
+        if self.set_type != 2:
+            self.data_x = []
+            self.data_y = []
+            self.data_x_mark = []
+            self.data_y_mark = []
+            for sample in range(self.num_samples):
+                for feature in range(self.num_features):
+                    seq_x = self.data[sample:sample+self.seq_len, feature:feature+1]
+                    seq_y = self.data[sample+self.seq_len:sample+self.seq_len+self.pred_len, feature:feature+1]
+                    seq_x_mark = data_stamp[sample:sample+self.seq_len]
+                    seq_y_mark = data_stamp[sample+self.seq_len:sample+self.seq_len+self.pred_len]
+                    self.data_x.append(seq_x)
+                    self.data_y.append(seq_y)
+                    self.data_x_mark.append(seq_x_mark)
+                    self.data_y_mark.append(seq_y_mark)
+        
+        else:
+            self.clustr_data_path = os.path.join(clustr_data_path, f'pred_len_{self.args.pred_len}')
+            self.data_x_path = f'{self.clustr_data_path}/{self.args.cluster_index}_test_x.npy'
+            self.data_x_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_test_x_mark.npy'
+            self.data_y_path = f'{self.clustr_data_path}/{self.args.cluster_index}_test_y.npy'
+            self.data_y_mark_path = f'{self.clustr_data_path}/{self.args.cluster_index}_test_y_mark.npy'
+            self.data_x = np.load(self.data_x_path)
+            self.data_y = np.load(self.data_y_path)
+            self.data_x_mark = np.load(self.data_x_mark_path)
+            self.data_y_mark = np.load(self.data_y_mark_path)
+            self.ds = np.load(f'{self.clustr_data_path}/{self.args.cluster_index}_test_ds.npy')
+        
+        
+
+    def __getitem__(self, index):
+        return self.data_x[index], self.data_y[index], self.data_x_mark[index], self.data_y_mark[index], self.ds[index]
+
+    def __len__(self):
+        return len(self.data_x)
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+    
+         
 class Dataset_ETT_hour(Dataset):
     def __init__(self, args, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',

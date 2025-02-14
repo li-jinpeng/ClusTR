@@ -5,7 +5,8 @@ cluster_amount=$2
 cluster_domain=time
 # cluster_domain=frequency
 
-for pred_len in 96 192 336 720
+# for pred_len in 96 192 336 720
+for pred_len in 96
     do
         for ((cluster_index=0; cluster_index<$cluster_amount; cluster_index++))
             do
@@ -31,7 +32,6 @@ for pred_len in 96 192 336 720
                 --d_model 128 \
                 --d_ff 128 \
                 --itr 1 \
-                --inverse \
                 --cluster_index $cluster_index \
                 --cluster_amount $cluster_amount \
                 --cluster_domain $cluster_domain

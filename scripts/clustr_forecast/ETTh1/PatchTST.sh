@@ -10,6 +10,7 @@ dict[336]=8
 dict[720]=16
 
 for pred_len in 96 192 336 720
+# for pred_len in 96
     do
         for ((cluster_index=0; cluster_index<$cluster_amount; cluster_index++))
             do
@@ -33,7 +34,6 @@ for pred_len in 96 192 336 720
                 --c_out 1 \
                 --des 'Exp' \
                 --itr 1 \
-                --inverse \
                 --n_heads ${dict[$pred_len]} \
                 --cluster_index $cluster_index \
                 --cluster_amount $cluster_amount \
