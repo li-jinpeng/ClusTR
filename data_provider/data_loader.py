@@ -5,48 +5,197 @@ import glob
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
+import pickle
 from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
+from tslearn.clustering import TimeSeriesKMeans
 from data_provider.uea import subsample, interpolate_missing, Normalizer
 from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
 from utils.augmentation import run_augmentation_single
-from utils.augmentation import jitter, time_warp, magnitude_warp
+from utils.augmentation import time_warp, magnitude_warp
 
 warnings.filterwarnings('ignore')
 
 
+aug_dict = {
+    'time_warp': time_warp,
+    'magnitude_warp': magnitude_warp,
+}
+
+
 class Dataset_ClusTR(Dataset):
     def __init__(self, args, root_path, flag='train', size=None,
-        features='S', data_path='ETTh1.csv',
-        target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
-        data_name = data_path.split('.')[0]
-        if args.cluster_amount != args.cluster_index or flag != 'test':
-            self.seq_x = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.cluster_index}_{flag}_x.npy')
-            self.seq_y = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.cluster_index}_{flag}_y.npy')
-            self.seq_x_mark = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.cluster_index}_{flag}_x_mark.npy')
-            self.seq_y_mark = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.cluster_index}_{flag}_y_mark.npy')
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+        # size [seq_len, label_len, pred_len]
+        self.args = args
+        # info
+        if size == None:
+            self.seq_len = 24 * 4 * 4
+            self.label_len = 24 * 4
+            self.pred_len = 24 * 4
         else:
-            self.seq_x = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.test_index}_{flag}_x.npy')
-            self.seq_y = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.test_index}_{flag}_y.npy')
-            self.seq_x_mark = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.test_index}_{flag}_x_mark.npy')
-            self.seq_y_mark = np.load(f'{data_name}/{args.cluster_amount}_{args.pred_len}/{args.test_index}_{flag}_y_mark.npy')
-        if args.aug == 1 and flag == 'train':
-            print(self.seq_x.shape, self.seq_y[:,-args.pred_len:,:].shape)
-            seq = np.concatenate([self.seq_x, self.seq_y[:,-args.pred_len:,:]], axis=1)
-            aug_seq = magnitude_warp(seq)
-            self.seq_x = np.concatenate([self.seq_x, aug_seq[:,:args.seq_len,:]], axis=0)
-            self.seq_y = np.concatenate([self.seq_y, aug_seq[:,args.seq_len-args.label_len:,:]], axis=0)
-            self.seq_y_mark = np.concatenate([self.seq_y_mark, self.seq_y_mark], axis=0)
-            self.seq_x_mark = np.concatenate([self.seq_x_mark, self.seq_x_mark], axis=0)
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
+        # init
+        assert flag in ['train', 'test', 'val']
+        self.type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = self.type_map[flag]
+        self.flag = flag
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+
+        self.root_path = root_path
+        self.data_path = data_path
+        self.data_name = data_path.split('.')[0]
+        self.cluster_path = os.path.join(self.args.clustr_dir, self.data_name, self.args.cluster_amount)
+        self.__read_data__()
         
+    def check_clustr_dir(self):
+        for cluster_index in range(self.args.cluster_amount):
+            for pred_len in [96, 192, 336, 720]:
+                for flag in ['train', 'test', 'val']:
+                    for type in ['x', 'y', 'x_mark', 'y_mark']:
+                        if not os.path.exists(
+                            os.path.join(self.cluster_path, cluster_index, pred_len, flag, f'{type}.npy')
+                        ):
+                            return False
+        return True
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        if 'ETTh' in self.data_name:
+            border1s = [0, 12 * 30 * 24 - 96, 12 * 30 * 24 + 4 * 30 * 24 - 96]
+            border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
+        elif 'ETTm' in self.data_name:
+            border1s = [0, 12 * 30 * 24 * 4 - 96, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4 - 96]
+            border2s = [12 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 8 * 30 * 24 * 4]
+        else:
+            num_train = int(len(df_raw) * 0.7)
+            num_test = int(len(df_raw) * 0.2)
+            num_vali = len(df_raw) - num_train - num_test
+            border1s = [0, num_train - 96, len(df_raw) - num_test - 96]
+            border2s = [num_train, num_train + num_vali, len(df_raw)]
+
+        if self.features == 'M' or self.features == 'MS':
+            cols_data = df_raw.columns[1:]
+            df_data = df_raw[cols_data]
+        elif self.features == 'S':
+            df_data = df_raw[[self.target]]
+
+        if self.scale:
+            train_data = df_data[border1s[0]:border2s[0]]
+            self.scaler.fit(train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
             
+        if not self.check_clustr_dir():
+            for pred_len in [96, 192, 336, 720]:
+                train_data = data[border1s[0]:border2s[0], :]
+                num_samples = train_data.shape[0] - self.seq_len - pred_len + 1
+                data_x = []
+                for sample in range(num_samples):
+                    data_x.append(train_data[sample:sample+self.seq_len, :])
+                km_path = f'{self.args.clustr_dir}/{self.data_name}/{pred_len}.pickle'
+                if os.path.exists(km_path):
+                    with open(km_path, "rb") as file:
+                        km = pickle.load(file)
+                else:
+                    km = TimeSeriesKMeans(n_clusters=self.args.cluster_amount, verbose=True, n_jobs=128, random_state=self.args.seed, tol=1e-8).fit(data_x)
+                    with open(km_path, "wb") as file:
+                        pickle.dump(km, file)
+                
+                for flag in ['train', 'val', 'test']:
+                    df_stamp = df_raw[['date']][border1s[self.type_map[flag]]:border2s[self.type_map[flag]]]
+                    df_stamp['date'] = pd.to_datetime(df_stamp.date)
+                    if self.timeenc == 0:
+                        df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
+                        df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
+                        df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
+                        df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
+                        data_stamp = df_stamp.drop(['date'], 1).values
+                    elif self.timeenc == 1:
+                        data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+                        data_stamp = data_stamp.transpose(1, 0)
+    
+                    flag_data = data[border1s[self.type_map[flag]]:border2s[self.type_map[flag]], :]
+                    flag_samples = flag_data.shape[0] - self.seq_len - pred_len + 1
+                    flag_x = []
+                    for sample in range(flag_samples):
+                        flag_x.append(flag_data[sample:sample+self.seq_len, :])
+                    cluster_labels = km.predict(flag_x)
+                    
+                    for cluster_index in range(self.args.cluster_amount):
+                        flag_path = f'{self.cluster_path}/{cluster_index}/{pred_len}/{flag}'
+                        if not os.path.exists(flag_path):
+                            os.makedirs(flag_path)
+                    
+                    x = [[] for _ in range(self.args.cluster_amount)]
+                    y = [[] for _ in range(self.args.cluster_amount)]
+                    x_mark = [[] for _ in range(self.args.cluster_amount)]
+                    y_mark = [[] for _ in range(self.args.cluster_amount)]
+                    for sample in range(flag_samples):
+                        seq_x = flag_data[sample:sample+96]
+                        seq_y = flag_data[sample+96-self.label_len:sample+96+pred_len]
+                        seq_x_mark = data_stamp[sample:sample+96]
+                        seq_y_mark = data_stamp[sample+96-self.label_len:sample+96+pred_len]
+                        closest_cluster_index = cluster_labels[sample]
+                        x[closest_cluster_index].append(seq_x)
+                        y[closest_cluster_index].append(seq_y)
+                        x_mark[closest_cluster_index].append(seq_x_mark)
+                        y_mark[closest_cluster_index].append(seq_y_mark)
+                    for cluster_index in range(self.args.cluster_amount):
+                        flag_path = f'{self.cluster_path}/{cluster_index}/{pred_len}/{flag}'
+                        print(self.data_name, pred_len, self.args.cluster_amount, cluster_index, flag, len(x[cluster_index]))
+                        np.save(os.path.join(flag_path, 'x'), np.array(x[cluster_index]))
+                        np.save(os.path.join(flag_path, 'y'), np.array(y[cluster_index]))
+                        np.save(os.path.join(flag_path, 'x_mark'), np.array(x_mark[cluster_index]))
+                        np.save(os.path.join(flag_path, 'y_mark'), np.array(y_mark[cluster_index]))
+        
+
+        self.seq_x = np.load(f'{self.cluster_path}/{self.args.cluster_index}/{self.args.pred_len}/{self.flag}/x.npy')
+        self.seq_y = np.load(f'{self.cluster_path}/{self.args.cluster_index}/{self.args.pred_len}/{self.flag}/y.npy')
+        self.seq_x_mark = np.load(f'{self.cluster_path}/{self.args.cluster_index}/{self.args.pred_len}/{self.flag}/x_mark.npy')
+        self.seq_y_mark = np.load(f'{self.cluster_path}/{self.args.cluster_index}/{self.args.pred_len}/{self.flag}/y_mark.npy')
+
+        if self.args.aug_methon != 'none' and self.flag=='train':
+            seq = np.concatenate([self.seq_x, self.seq_y[:,-self.args.pred_len:,:]], axis=1)
+            aug_seq = aug_dict[self.args.aug_methon](seq, self.args.aug_param)
+            
+            km_path = f'{self.args.clustr_dir}/{self.data_name}/{self.args.pred_len}.pickle'
+            if os.path.exists(km_path):
+                with open(km_path, "rb") as file:
+                    km = pickle.load(file)
+            else:
+                km = TimeSeriesKMeans(n_clusters=self.args.cluster_amount, verbose=True, n_jobs=128, random_state=self.args.seed, tol=1e-8).fit(self.seq_x)
+                with open(km_path, "wb") as file:
+                    pickle.dump(km, file)
+            labels = km.predict(aug_seq[:,:self.args.seq_len,:])
+            aug_seq = aug_seq[labels == self.args.cluster_index]
+            
+            self.seq_x = np.concatenate([self.seq_x, aug_seq[:,:self.args.seq_len,:]], axis=0)
+            self.seq_y = np.concatenate([self.seq_y, aug_seq[:,self.args.seq_len-self.args.label_len:,:]], axis=0)
+            self.seq_y_mark = np.concatenate([self.seq_y_mark, self.seq_y_mark[labels == self.args.cluster_index]], axis=0)
+            self.seq_x_mark = np.concatenate([self.seq_x_mark, self.seq_x_mark[labels == self.args.cluster_index]], axis=0)
+        
+
     def __getitem__(self, index):
         return self.seq_x[index], self.seq_y[index], self.seq_x_mark[index], self.seq_y_mark[index]
-    
+
     def __len__(self):
         return len(self.seq_x)
+    
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
     
     
 class Dataset_ETT_hour(Dataset):

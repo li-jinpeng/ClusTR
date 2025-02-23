@@ -140,13 +140,17 @@ if __name__ == '__main__':
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     
+    # ClusTR
     parser.add_argument('--cluster_amount', type=int, default=2)
     parser.add_argument('--cluster_index', type=int, default=0)
-    parser.add_argument('--test_index', type=int, default=0)
-    parser.add_argument('--aug', type=int, default=0)
-    parser.add_argument('--early_stop', type=int, default=1)
+    parser.add_argument('--aug_methon', type=str, default='none')
+    parser.add_argument('--aug_param', type=float, default=0.2)
+    parser.add_argument('--early_stop', action='store_true')
+    parser.add_argument('--clustr_dir', type=str, default='./clustr')
+    
 
     args = parser.parse_args()
+    args.seed = fix_seed
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
         print('Using GPU')
